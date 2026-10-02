@@ -1,0 +1,15 @@
+[project]
+name = "rpi-vision"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.14, <3.15"
+dependencies = [
+    "pyside6>=6.11.2",
+]
+
+[dependency-groups]
+dev = [
+    "numpy>=2.5.3",
+    "opencv-python-headless>=5.0.0.93",
+]
