@@ -1,13 +1,11 @@
 import logging
 import sys
+from gpio import gpio
 from pathlib import Path
 
-import cv2
-from PySide6.QtCore import QLocale, QMetaObject, QThread, QTranslator, Qt
-from PySide6.QtGui import QImage, QPixmap
+from PySide6.QtCore import QLocale, QMetaObject, QTranslator, Qt, QTimer, Slot
 from PySide6.QtWidgets import (
     QApplication,
-    QComboBox,
     QHBoxLayout,
     QLabel,
     QMainWindow,
@@ -19,46 +17,158 @@ from PySide6.QtWidgets import (
 
 import camera as camera_module
 import config
-import controller
-from capture import CaptureThread
-from processing import STATUS_ALARM, STATUS_NO_REFERENCE, STATUS_NORMAL, Processor
+from autorun import setup as autorun_setup
+from camera_panel import NO_CAMERA, CameraPanel
 
 BASE_DIR = Path(__file__).parent
+
+def app_stylesheet() -> str:
+    return f"""
+    * {{
+        font-family: "DejaVu Sans";
+        font-size: {config.UI_FONT_SIZE}px;
+    }}
+    QMainWindow, QWidget {{
+        background-color: #f5f5f5;
+        color: #202020;
+    }}
+    QPushButton {{
+        min-height: {config.UI_BUTTON_MIN_HEIGHT}px;
+        min-width: {config.UI_BUTTON_MIN_WIDTH}px;
+        padding: 4px 2px;
+        border-radius: 8px;
+        border: 2px solid #888;
+        background-color: #ffffff;
+        color: #202020;
+        font-weight: 600;
+    }}
+    QPushButton:pressed {{
+        background-color: #d8d8d8;
+        border-color: #444;
+    }}
+    QPushButton:disabled {{
+        background-color: #e8e8e8;
+        color: #999;
+        border-color: #ccc;
+    }}
+    QSlider::groove:vertical {{
+        width: 24px;
+        background: #d0d0d0;
+        border-radius: 12px;
+    }}
+    QSlider::handle:vertical {{
+        background: #4a90e2;
+        min-height: 80px;
+        margin: 0 -18px;
+        border-radius: 20px;
+    }}
+    QSlider::handle:vertical:pressed {{
+        background: #2f6fc0;
+    }}
+    QSlider:vertical {{
+        min-width: 90px;
+    }}
+    QSlider::groove:vertical {{
+        width: 16px;
+        background: #d0d0d0;
+        border-radius: 8px;
+    }}
+    QSlider::handle:vertical {{
+        background: #4a90e2;
+        border: 3px solid #2f6fc0;
+        width: 64px;
+        height: 64px;
+        min-width: 64px;
+        min-height: 64px;
+        margin: 0 -24px;
+        border-radius: 32px;
+    }}
+    QSlider::handle:vertical:pressed {{
+        background: #2f6fc0;
+    }}
+    """
+
+
+
+from processing import STATUS_ALARM, STATUS_NO_REFERENCE, STATUS_NORMAL
+
+# Минимальная ширина панели камеры: три кнопки в ряд должны поместиться,
+# когда PREVIEW_WIDTH делится между камерами.
+MIN_PANEL_WIDTH = 380
 
 
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle(self.tr("Camera monitor"))
-        self.setFixedSize(config.PREVIEW_WIDTH + 150, config.PREVIEW_HEIGHT + 330)
+        self._camera_count = max(1, int(getattr(config, "CAMERA_COUNT", 1)))
+        
+        # Считаем размер панели
+        self._panel_width = max(config.PREVIEW_WIDTH // self._camera_count, MIN_PANEL_WIDTH)
+        self.setMinimumSize(self._panel_width * self._camera_count + 300,
+                            config.PREVIEW_HEIGHT + 200)
 
         central = QWidget()
         self.setCentralWidget(central)
         layout = QVBoxLayout(central)
-        layout.setAlignment(Qt.AlignmentFlag.AlignHCenter)
+        layout.setAlignment(Qt.AlignmentFlag.AlignTop)
+        layout.setContentsMargins(20, 20, 20, 20)
+        layout.setSpacing(20)
 
-        camera_row = QHBoxLayout()
-        camera_row.addWidget(QLabel(self.tr("Camera:")))
-        self.camera_combo = QComboBox()
-        for index in camera_module.list_cameras():
-            self.camera_combo.addItem(f"Camera {index}", userData=index)
-        self.camera_combo.activated.connect(self._on_camera_selected)
-        camera_row.addWidget(self.camera_combo, stretch=1)
-        layout.addLayout(camera_row)
+        cameras = camera_module.list_cameras()
 
-        video_row = QHBoxLayout()
-        self.video_label = QLabel()
-        self.video_label.setFixedSize(config.PREVIEW_WIDTH, config.PREVIEW_HEIGHT)
-        self.video_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.video_label.setStyleSheet("background-color: #202020; color: #aaaaaa; border: 1px solid #444;")
-        self.video_label.setText(self.tr("Camera not available"))
-        video_row.addWidget(self.video_label, alignment=Qt.AlignmentFlag.AlignHCenter)
+        cameras_row = QHBoxLayout()
+        cameras_row.setAlignment(Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignLeft)
+        cameras_row.setSpacing(20)
 
+        self._panels = []
+        self._statuses = [NO_CAMERA] * self._camera_count
+        
+        # 1. Добавляем сами панели камер
+        for slot in range(self._camera_count):
+            panel = CameraPanel(slot, (self._panel_width, config.PREVIEW_HEIGHT), cameras)
+            panel.status_changed.connect(self._on_panel_status)
+            self._panels.append(panel)
+            cameras_row.addWidget(panel)
+            
+        # 2. Добавляем кнопку Refresh прямо СЮДА ЖЕ, прижимая её к верху
+        self.refresh_button = QPushButton(self.tr("Refresh"))
+        self.refresh_button.clicked.connect(self._on_refresh_cameras)
+        # AlignTop гарантирует, что она встанет на одну линию с ComboBox и Settings
+        cameras_row.addWidget(self.refresh_button, alignment=Qt.AlignmentFlag.AlignTop)
+
+        # 3. Пружина, которая отодвигает слайдер к правому краю
+        cameras_row.addStretch(1)
+        
+        # 4. Панель со слайдером (кнопки + и -)
+        cameras_row.addLayout(self._build_threshold_panel()) 
+        
+        layout.addLayout(cameras_row)
+
+        # --- ИНИЦИАЛИЗАЦИЯ GPIO ---
+        self._current_status = NO_CAMERA
+        self._heartbeat_state = True
+        gpio.set_output("heartbeat", True)
+        
+        self._hb_timer = QTimer(self)
+        self._hb_timer.setInterval(200)
+        self._hb_timer.timeout.connect(self._tick_heartbeat)
+        self._hb_timer.start()
+
+        gpio.set_callbacks({
+            "set_reference": self._on_gpio_action("arm_reference"),
+            "detect": self._on_gpio_action("request_detect"),
+        })
+        gpio.set_ready(False)
+
+    def _build_threshold_slider(self) -> QVBoxLayout:
         # Вертикальный слайдер порога тревоги (доля изменившихся пикселей).
         # Маппинг: значение слайдера 1..200 -> 0.1%..20.0% -> ratio 0.001..0.2.
+        # Порог общий для всех камер — config.CHANGE_RATIO_THRESHOLD.
         slider_col = QVBoxLayout()
         slider_col.setAlignment(Qt.AlignmentFlag.AlignHCenter)
-        slider_col.addWidget(QLabel(self.tr("Alarm %")), alignment=Qt.AlignmentFlag.AlignHCenter)
+        slider_col.addWidget(QLabel(self.tr("Alarm %")),
+                             alignment=Qt.AlignmentFlag.AlignHCenter)
         self.threshold_slider = QSlider(Qt.Orientation.Vertical)
         self.threshold_slider.setRange(1, 200)
         self.threshold_slider.setValue(int(round(config.CHANGE_RATIO_THRESHOLD * 1000)))
@@ -73,98 +183,111 @@ class MainWindow(QMainWindow):
         self.threshold_value_label.setAlignment(Qt.AlignmentFlag.AlignHCenter)
         self._update_threshold_label(self.threshold_slider.value())
         slider_col.addWidget(self.threshold_value_label, alignment=Qt.AlignmentFlag.AlignHCenter)
-        video_row.addLayout(slider_col)
-        layout.addLayout(video_row)
+        return slider_col
 
-        mono = "font-family: monospace; font-size: 14px;"
-        self.status_label = QLabel()
-        self.status_label.setStyleSheet(mono + "font-weight: bold;")
-        self.reference_label = QLabel()
-        self.reference_label.setStyleSheet(mono)
-        self.change_label = QLabel()
-        self.change_label.setStyleSheet(mono)
-        self.last_check_label = QLabel()
-        self.last_check_label.setStyleSheet(mono)
-        self.trigger_label = QLabel()
-        self.trigger_label.setStyleSheet(mono)
-        layout.addWidget(self.status_label)
-        layout.addWidget(self.reference_label)
-        layout.addWidget(self.change_label)
-        layout.addWidget(self.last_check_label)
-        layout.addWidget(self.trigger_label)
+    def _build_threshold_panel(self) -> QVBoxLayout:
+        col = QVBoxLayout()
+        col.setSpacing(config.UI_SPACING)
+        col.setContentsMargins(8, 0, 8, 0)
 
-        buttons_row = QHBoxLayout()
-        self.set_reference_button = QPushButton(self.tr("Set reference"))
-        self.set_reference_button.setEnabled(False)
-        self.set_reference_button.clicked.connect(self._on_set_reference)
-        buttons_row.addWidget(self.set_reference_button)
-        self.detect_button = QPushButton(self.tr("Detect change"))
-        self.detect_button.setEnabled(False)
-        self.detect_button.clicked.connect(self._on_detect)
-        buttons_row.addWidget(self.detect_button)
-        layout.addLayout(buttons_row)
+        title = QLabel(self.tr("Alarm %"))
+        title.setAlignment(Qt.AlignmentFlag.AlignHCenter)
+        title.setStyleSheet(f"font-size: {config.UI_HEADER_FONT_SIZE}px; font-weight: bold;")
+        col.addWidget(title)
 
-        self._set_status("NO_CAMERA")
-        self.change_label.setText(self.tr("Change: -"))
-        self.trigger_label.setText(self.tr("Trigger: -"))
+        self.threshold_value_label = QLabel()
+        self.threshold_value_label.setAlignment(Qt.AlignmentFlag.AlignHCenter)
+        self.threshold_value_label.setStyleSheet(
+            f"font-size: {config.UI_HEADER_FONT_SIZE + 10}px; "
+            f"font-weight: bold; color: #4a90e2;"
+        )
+        col.addWidget(self.threshold_value_label)
 
-        self._capture_thread = None
-        self._process_thread = QThread(self)
-        self._processor = Processor()
-        self._processor.moveToThread(self._process_thread)
-        self._processor.result_ready.connect(self._on_result)
-        self._processor.detection_done.connect(self._on_detection_done)
-        self._process_thread.start()
+        initial = int(round(config.CHANGE_RATIO_THRESHOLD * 1000))
+        self.threshold_slider = QSlider(Qt.Orientation.Vertical)
+        self.threshold_slider.setRange(1, 200)
+        self.threshold_slider.setValue(initial)   # до connect — не триггерит слот
+        self.threshold_slider.setTickPosition(QSlider.TickPosition.TicksRight)
+        self.threshold_slider.setTickInterval(20)
+        self.threshold_slider.setSingleStep(1)
+        self.threshold_slider.setPageStep(10)
+        self.threshold_slider.setMinimumHeight(380)
+        self.threshold_slider.valueChanged.connect(self._on_threshold_changed)
+        self._update_threshold_label(initial)
 
-        self._start_capture(self.camera_combo.currentData())
+        up_btn = QPushButton("+")
+        up_btn.setMinimumHeight(config.UI_BUTTON_MIN_HEIGHT)
+        up_btn.clicked.connect(
+            lambda: self.threshold_slider.setValue(
+                min(200, self.threshold_slider.value() + 5)
+            )
+        )
+        col.addWidget(up_btn)
 
-    def _start_capture(self, camera_index):
-        if camera_index is None:
-            self._on_camera_error()
-            return
-        # На случай повторного старта (смена камеры) — сначала тихо глушим старый.
-        self._stop_capture()
-        # parent=None: объект живёт в главном потоке, но детей в run() больше
-        # нет (бывший QTimer(self) и давал варнинг + отсутствие картинки).
-        # Удаление — через finished->deleteLater, ссылку чистим в _stop_capture.
-        self._capture_thread = CaptureThread(camera_index)
-        self._capture_thread.camera_error.connect(self._on_camera_error)
-        self._capture_thread.frame_captured.connect(self._processor.on_frame)
-        self._capture_thread.finished.connect(self._capture_thread.deleteLater)
-        self._capture_thread.start()
+        col.addWidget(self.threshold_slider, alignment=Qt.AlignmentFlag.AlignHCenter)
 
-    def _stop_capture(self):
-        thread, self._capture_thread = self._capture_thread, None
-        if thread is not None:
-            # Отключаем error чтобы остановленный поток не перетирал UI
-            # уже стартовавшего нового захвата (смена камеры).
-            try:
-                thread.camera_error.disconnect(self._on_camera_error)
-            except Exception:
-                pass
-            try:
-                thread.frame_captured.disconnect(self._processor.on_frame)
-            except Exception:
-                pass
-            thread.stop()
-            # CaptureThread дросселирован сверху до CAPTURE_MAX_FPS,
-            # поэтому долгое блочивание GUI здесь исключено.
-            thread.wait(3000)
+        down_btn = QPushButton("−")
+        down_btn.setMinimumHeight(config.UI_BUTTON_MIN_HEIGHT)
+        down_btn.clicked.connect(
+            lambda: self.threshold_slider.setValue(
+                max(1, self.threshold_slider.value() - 5)
+            )
+        )
+        col.addWidget(down_btn)
 
-    def _on_camera_selected(self):
-        self._stop_capture()
-        controller.clear_reference()
-        self.reference_label.setText(self.tr("Reference: NOT SET"))
-        self.trigger_label.setText(self.tr("Trigger: -"))
-        self._set_status("NO_CAMERA")
-        self.set_reference_button.setEnabled(False)
-        self.detect_button.setEnabled(False)
-        self._start_capture(self.camera_combo.currentData())
+        return col
+
+    @Slot()
+    def _on_refresh_cameras(self):
+        self.refresh_button.setEnabled(False)
+        try:
+            # list_cameras() для picamera2/mindvision переоткрывает общий
+            # camera.open()/close() — живые захваты это убьёт, глушим заранее.
+            for panel in self._panels:
+                panel.stop_capture()
+            cameras = camera_module.list_cameras()
+            for panel in self._panels:
+                panel.reload_cameras(cameras)
+        finally:
+            self.refresh_button.setEnabled(True)
+
+    def _on_panel_status(self, slot: int, status: str):
+        self._statuses[slot] = status
+        any_alarm = any(s == STATUS_ALARM for s in self._statuses)
+        any_no_camera = any(s == NO_CAMERA for s in self._statuses)
+        any_no_reference = any(s == STATUS_NO_REFERENCE for s in self._statuses)
+
+        if any_alarm:
+            self._current_status = STATUS_ALARM
+        elif any_no_camera:
+            self._current_status = NO_CAMERA
+        elif any_no_reference:
+            self._current_status = STATUS_NO_REFERENCE
+        else:
+            self._current_status = STATUS_NORMAL
+
+        gpio.set_ready(not any_no_camera and not any_no_reference)
+
+
+    def _on_gpio_action(self, method: str):
+        def _call():
+            for panel in self._panels:
+                QMetaObject.invokeMethod(panel, method, Qt.ConnectionType.QueuedConnection)
+        return _call
+
+    def _tick_heartbeat(self):
+        if self._current_status == STATUS_NORMAL:
+            self._heartbeat_state = not self._heartbeat_state
+        else:
+            self._heartbeat_state = True
+        gpio.set_output("heartbeat", self._heartbeat_state)
+        # print(self._heartbeat_state)
 
     def _update_threshold_label(self, slider_value: int):
         percent = slider_value / 10.0
         self.threshold_value_label.setText(f"{percent:.1f} %")
 
+    @Slot(int)
     def _on_threshold_changed(self, slider_value: int):
         # Живое изменение порога: detector.compare читает
         # config.CHANGE_RATIO_THRESHOLD при каждом кадре.
@@ -185,10 +308,12 @@ class MainWindow(QMainWindow):
             f"font-family: monospace; font-size: 14px; font-weight: bold; color: {color};"
         )
 
+    @Slot()
     def _on_set_reference(self):
         QMetaObject.invokeMethod(self._processor, "on_set_reference",
                                  Qt.ConnectionType.QueuedConnection)
 
+    @Slot()
     def _on_detect(self):
         self.detect_button.setEnabled(False)
         QMetaObject.invokeMethod(self._processor, "on_detect",
@@ -215,11 +340,17 @@ class MainWindow(QMainWindow):
         self.trigger_label.setText(self.tr("Trigger: -"))
         self.set_reference_button.setEnabled(False)
         self.detect_button.setEnabled(False)
+        self._current_status = "NO_CAMERA"
+        gpio.set_ready(False)
 
     def _on_result(self, frame, status: str, elapsed_ms: float, has_reference: bool,
                    change_ratio: float, boxes: list):
         # 30 FPS: тяжёлая обработка уже сделана в Processor, здесь только
         # BGR->RGB + QImage. copy() отвязывает QPixmap от numpy-буфера.
+
+        self._current_status = status
+        self._set_status(status)
+
         try:
             if frame is None or getattr(frame, "size", 0) == 0:
                 return
@@ -243,7 +374,6 @@ class MainWindow(QMainWindow):
         except Exception:
             return
 
-        self._set_status(status)
         self.reference_label.setText(
             self.tr("Reference: OK") if has_reference else self.tr("Reference: NOT SET")
         )
@@ -252,11 +382,16 @@ class MainWindow(QMainWindow):
             self.last_check_label.setText(self.tr("Last check: {} ms").format(round(elapsed_ms, 1)))
         self.set_reference_button.setEnabled(True)
         self.detect_button.setEnabled(has_reference)
+        for panel in self._panels:
+            panel.reset_confirmation()
 
     def closeEvent(self, event):
-        self._stop_capture()
-        self._process_thread.quit()
-        self._process_thread.wait(3000)
+        self._hb_timer.stop()
+        gpio.set_output("heartbeat", False)
+        gpio.set_ready(False)
+        gpio.close()
+        for panel in self._panels:
+            panel.close_capture()
         camera_module.release_camera()
         super().closeEvent(event)
 
@@ -272,7 +407,14 @@ def main():
         ],
     )
 
+    gpio.setup()
+
+    # config.AUTORUN -> юнит systemd на автозапуск. Ошибки не фатальны:
+    # autorun сам логирует и возвращает False.
+    autorun_setup()
+
     app = QApplication(sys.argv)
+    app.setStyleSheet(app_stylesheet())
 
     translator = QTranslator(app)
     locale = QLocale.system().name().split("_")[0]
@@ -280,7 +422,8 @@ def main():
         app.installTranslator(translator)
 
     window = MainWindow()
-    window.show()
+    # window.show()
+    window.showFullScreen()
     sys.exit(app.exec())
 
 
