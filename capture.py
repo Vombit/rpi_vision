@@ -1,59 +1,79 @@
 import time
+from queue import Empty, SimpleQueue
+from threading import Lock
 
 import cv2
 from PySide6.QtCore import QThread, Signal
 
 import camera as camera_module
 import config
-from preprocessing import crop_roi
 
 
 class CaptureThread(QThread):
-    """Поток захвата — единственный читатель своей камеры.
+    """Читает свою камеру и хранит последний полный кадр до передачи в обработку."""
 
-    Раньше здесь был QTimer(self), созданный внутри run(): родитель
-    жил в главном потоке -> "Cannot create children for a parent that
-    is in a different thread", таймер не фаерился, картинки не было.
-    Теперь обычный цикл без Qt-детей в рабочем потоке: читаем камеру
-    с её собственной скоростью и только дросселируем выдачу сверху
-    до CAPTURE_MAX_FPS (камере FPS не навязываем).
-
-    Экземпляр на камеру: каждая панель получает свой Camera и свой
-    поток, иначе вторая open() закрыла бы хендл первой.
-    """
-
-    camera_error = Signal()
+    camera_error = Signal(object)
     frame_captured = Signal(object)
+    settings_read = Signal(object, str, object)
+    settings_applied = Signal(object, object, object, object, object)
 
-    def __init__(self, camera_index: int = 0, preview_size=None, roi_getter=None, parent=None):
+    def __init__(self, camera_index: int = 0, parent=None):
         super().__init__(parent)
         self._camera_index = camera_index
-        self._preview_size = preview_size or (config.PREVIEW_WIDTH, config.PREVIEW_HEIGHT)
-        self._get_roi = roi_getter if roi_getter is not None else lambda: None
+        self._frame_lock = Lock()
+        self._latest = None
+        self._settings_requests = SimpleQueue()
+
+    def take_frame(self):
+        with self._frame_lock:
+            frame, self._latest = self._latest, None
+            return frame
+
+    def request_settings(self, token):
+        self._settings_requests.put((token, None))
+
+    def request_settings_apply(self, token, values):
+        self._settings_requests.put((token, dict(values)))
+
+    def _handle_settings(self, cam):
+        try:
+            token, requested = self._settings_requests.get_nowait()
+        except Empty:
+            return
+        try:
+            if requested is None:
+                self.settings_read.emit(token, *cam.read_opencv_controls())
+            else:
+                rejected, unverified, error = cam.apply_opencv_controls(self._camera_index, requested)
+                _, actual = cam.read_opencv_controls()
+                self.settings_applied.emit(token, actual, rejected, unverified, error)
+        except (camera_module.CameraError, cv2.error):
+            if requested is None:
+                self.settings_read.emit(token, "", {})
+            else:
+                self.settings_applied.emit(token, {}, dict.fromkeys(requested), [], None)
 
     def run(self):
         cam = camera_module.Camera()
         if not cam.open(self._camera_index):
-            self.camera_error.emit()
+            self.camera_error.emit(self)
             return
         max_fps = float(getattr(config, "CAPTURE_MAX_FPS", 30))
         min_interval_ms = 1000.0 / max_fps if max_fps > 0 else 0.0
         while not self.isInterruptionRequested():
+            self._handle_settings(cam)
             started = time.perf_counter()
             try:
                 frame = cam.read()
             except camera_module.CameraError:
-                self.camera_error.emit()
+                self.camera_error.emit(self)
                 break
-            try:
-                preview = cv2.resize(
-                    crop_roi(frame, self._get_roi()),
-                    self._preview_size,
-                    interpolation=cv2.INTER_AREA,
-                )
-            except Exception:
-                continue
-            self.frame_captured.emit(preview)
+            if frame is not None and frame.size:
+                with self._frame_lock:
+                    notify = self._latest is None
+                    self._latest = (started, frame)
+                if notify:
+                    self.frame_captured.emit(self)
             # Только ограничение сверху: если камера быстрее max_fps —
             # досыпаем до минимального интервала, если медленнее —
             # сразу идём за следующим кадром.

@@ -13,3 +13,5 @@ wheels/
 debug/
 app.log
 camera_settings.json
+opencv_camera_settings.json
+opencv_camera_settings.json.tmp

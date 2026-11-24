@@ -6,6 +6,7 @@ import cv2
 import numpy as np
 
 import config
+import opencv_controls
 import v4l2
 
 log = logging.getLogger(__name__)
@@ -39,8 +40,15 @@ def _resolve_backend() -> str:
 
 
 def _opencv_backend_flags() -> list[int]:
-    names = list(getattr(config, "OPENCV_BACKENDS_PREFER", ("DSHOW", "MSMF")))
-    names.append("ANY")
+    preferred = config.OPENCV_BACKENDS_PREFER
+    if preferred is None:
+        if sys.platform == "win32":
+            preferred = ("DSHOW", "MSMF")
+        elif sys.platform == "darwin":
+            preferred = ("AVFOUNDATION",)
+        else:
+            preferred = ("V4L2",)
+    names = (preferred, "ANY") if isinstance(preferred, str) else (*preferred, "ANY")
     flags: list[int] = []
     for name in names:
         flag = getattr(cv2, f"CAP_{name}", None)
@@ -131,7 +139,8 @@ class Camera:
         # (WARN ... libavdevice) и open/проба камер виснет.
         # Настройки V4L2 — до открытия: драйвер отдаёт текущие значения
         # только пока устройство не стримит.
-        applied = v4l2.apply_for_index(index)
+        use_v4l2 = sys.platform.startswith("linux") and v4l2.available()
+        applied = use_v4l2 and v4l2.apply_for_index(index)
         for flag in _opencv_backend_flags():
             cap = cv2.VideoCapture(index, flag)
             try:
@@ -149,12 +158,14 @@ class Camera:
                     actual_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
 
 
-                    if config.LOCK_CAMERA_PARAMS and not applied:
+                    backend = cap.getBackendName()
+                    saved = {} if use_v4l2 else opencv_controls.saved_values(backend, index)
+                    if config.LOCK_CAMERA_PARAMS and not applied and sys.platform.startswith("linux") and not saved:
                         self._fix_params(cap)
-                    elif applied:
-                        # _fix_params включает автоэкспозицию через OpenCV и
-                        # затёрла бы экспозицию из config.V4L2_CONTROLS.
-                        log.debug("OpenCV exposure fix skipped (V4L2_CONTROLS)")
+                    if saved:
+                        _, rejected, _ = opencv_controls.apply_values(cap, backend, saved)
+                        if rejected:
+                            log.warning("Camera %s (%s) rejected saved settings: %s", index, backend, rejected)
                     self._cap = cap
                     self._backend = "opencv"
                     log.info("Camera initialized (index=%s, backend=opencv flag=%s)", index, flag)
@@ -166,6 +177,26 @@ class Camera:
             except Exception:
                 pass
         return False
+
+    def read_opencv_controls(self):
+        if self._cap is None:
+            raise CameraError("No active OpenCV camera")
+        backend = self._cap.getBackendName()
+        return backend, opencv_controls.read_values(self._cap, backend)
+
+    def apply_opencv_controls(self, index, values):
+        if self._cap is None:
+            raise CameraError("No active OpenCV camera")
+        backend = self._cap.getBackendName()
+        accepted, rejected, unverified = opencv_controls.apply_values(self._cap, backend, values)
+        error = None
+        if accepted:
+            try:
+                opencv_controls.save_values(backend, index, accepted)
+            except (OSError, ValueError) as exc:
+                error = str(exc)
+                log.warning("Could not save camera settings: %s", exc)
+        return rejected, unverified, error
 
     def _open_picamera2_locked(self, index) -> bool:
         try:
@@ -207,15 +238,10 @@ class Camera:
 
     @staticmethod
     def _fix_params(cap):
-        # На Windows через DirectShow/MSMF работает не везде — best-effort.
         try:
-            if sys.platform.startswith("linux"):
-                cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, 1)
-                cap.set(cv2.CAP_PROP_EXPOSURE, 150)
-                cap.set(cv2.CAP_PROP_AUTO_WB, 0)
-            else:
-                cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, 0.25)
-                cap.set(cv2.CAP_PROP_AUTO_WB, 0)
+            cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, 1)
+            cap.set(cv2.CAP_PROP_EXPOSURE, 150)
+            cap.set(cv2.CAP_PROP_AUTO_WB, 0)
         except Exception:
             log.warning("Could not lock camera parameters (exposure/WB)")
 

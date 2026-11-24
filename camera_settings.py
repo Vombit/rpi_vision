@@ -11,11 +11,12 @@ Apply сначала применяет, затем ПЕРЕЧИТЫВАЕТ к�
 
 import logging
 
-from PySide6.QtCore import Qt
+from PySide6.QtCore import Qt, Signal, Slot
 from PySide6.QtWidgets import (
     QComboBox,
     QDialog,
     QDialogButtonBox,
+    QDoubleSpinBox,
     QFormLayout,
     QLabel,
     QMessageBox,
@@ -27,6 +28,7 @@ from PySide6.QtWidgets import (
 )
 
 import config
+from opencv_controls import MANUAL_PROPERTIES
 import v4l2
 
 log = logging.getLogger(__name__)
@@ -39,6 +41,8 @@ TYPE_LABELS = {
 
 class CameraSettingsDialog(QDialog):
     """Параметры одной камеры. Apply: значения применены и проверены."""
+
+    applying = Signal()
 
     def __init__(self, camera_index, device, applied_values, parent=None):
         super().__init__(parent)
@@ -207,6 +211,7 @@ class CameraSettingsDialog(QDialog):
             return
 
         try:
+            self.applying.emit()
             v4l2.apply_values(self.camera_index, requested)
         except Exception as exc:  # noqa: BLE001 — диалог не должен падать
             log.warning("v4l2 apply failed: %s", exc)
@@ -259,3 +264,144 @@ class CameraSettingsDialog(QDialog):
 
         log.info("Camera settings applied to %s: %d control(s)", self.device, len(requested))
         self.accept()
+
+
+class OpenCVCameraSettingsDialog(QDialog):
+    applying = Signal()
+
+    def __init__(self, capture, parent=None):
+        super().__init__(parent)
+        self._capture = capture
+        self._token = object()
+        self._baseline = {}
+        self._editors = {}
+        self._names = {
+            "auto_exposure": self.tr("Auto exposure"),
+            "autofocus": self.tr("Autofocus"),
+            "auto_white_balance": self.tr("Auto white balance"),
+            "exposure": self.tr("Exposure"),
+            "gain": self.tr("Gain"),
+            "focus": self.tr("Focus"),
+            "white_balance": self.tr("White balance"),
+            "brightness": self.tr("Brightness"),
+            "contrast": self.tr("Contrast"),
+            "saturation": self.tr("Saturation"),
+            "sharpness": self.tr("Sharpness"),
+        }
+        self.setWindowTitle(self.tr("Camera settings"))
+        self.setMinimumSize(560, 460)
+        layout = QVBoxLayout(self)
+        self._message = QLabel(self.tr("Reading camera controls…"))
+        self._message.setWordWrap(True)
+        self._message.setTextFormat(Qt.TextFormat.PlainText)
+        layout.addWidget(self._message)
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        self._form_host = QWidget()
+        self._form = QFormLayout(self._form_host)
+        scroll.setWidget(self._form_host)
+        layout.addWidget(scroll)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Apply |
+                                   QDialogButtonBox.StandardButton.Close)
+        self._apply = buttons.button(QDialogButtonBox.StandardButton.Apply)
+        self._apply.setText(self.tr("Apply"))
+        buttons.button(QDialogButtonBox.StandardButton.Close).setText(self.tr("Close"))
+        self._apply.setEnabled(False)
+        self._apply.clicked.connect(self._on_apply)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+        capture.settings_read.connect(self._on_read)
+        capture.settings_applied.connect(self._on_applied)
+        capture.finished.connect(self._unavailable)
+        capture.request_settings(self._token)
+
+    @Slot()
+    def _unavailable(self):
+        self._message.setText(self.tr("Controls are unavailable for this camera backend."))
+        self._apply.setEnabled(False)
+        self._form_host.setEnabled(False)
+
+    @Slot(object, str, object)
+    def _on_read(self, token, backend, values):
+        if token is not self._token:
+            return
+        if not values:
+            self._unavailable()
+            return
+        self._message.setText(self.tr("{} · Values use camera driver units.").format(backend))
+        for name, value in values.items():
+            if name in MANUAL_PROPERTIES:
+                editor = QComboBox()
+                editor.addItem(self.tr("Unknown"), None)
+                editor.addItem(self.tr("Manual"), 0)
+                editor.addItem(self.tr("Automatic"), 1)
+                editor.currentIndexChanged.connect(self._sync_manual_controls)
+            else:
+                editor = QDoubleSpinBox()
+                editor.setRange(-1_000_000, 1_000_000)
+                editor.setDecimals(3)
+                editor.setSpecialValueText(self.tr("Unknown"))
+            self._editors[name] = editor
+            self._form.addRow(self._names[name], editor)
+            self._show_value(name, value)
+        self._sync_manual_controls()
+        self._apply.setEnabled(True)
+
+    def _sync_manual_controls(self):
+        for mode, manual in MANUAL_PROPERTIES.items():
+            if mode in self._editors and manual in self._editors:
+                self._editors[manual].setEnabled(self._value(self._editors[mode]) != 1)
+
+    def _show_value(self, name, value):
+        editor = self._editors[name]
+        if isinstance(editor, QComboBox):
+            editor.setCurrentIndex(max(0, editor.findData(value)))
+        else:
+            editor.setValue(editor.minimum() if value is None else value)
+        self._baseline[name] = self._value(editor)
+
+    @staticmethod
+    def _value(editor):
+        if isinstance(editor, QComboBox):
+            return editor.currentData()
+        number = editor.value()
+        return None if number == editor.minimum() else number
+
+    @Slot()
+    def _on_apply(self):
+        requested = {}
+        for name, editor in self._editors.items():
+            value = self._value(editor)
+            if editor.isEnabled() and value is not None and value != self._baseline[name]:
+                requested[name] = value
+        if not requested:
+            return
+        self._apply.setEnabled(False)
+        self._form_host.setEnabled(False)
+        self._message.setText(self.tr("Applying camera controls…"))
+        self.applying.emit()
+        self._capture.request_settings_apply(self._token, requested)
+
+    @Slot(object, object, object, object, object)
+    def _on_applied(self, token, actual, rejected, unverified, save_error):
+        if token is not self._token:
+            return
+        for name, value in actual.items():
+            self._show_value(name, value)
+        messages = []
+        if rejected:
+            names = ", ".join(self._names[name] for name in rejected)
+            messages.append(self.tr("Driver rejected or changed: {}").format(names))
+        if unverified:
+            names = ", ".join(self._names[name] for name in unverified)
+            messages.append(self.tr("Driver accepted without readback: {}").format(names))
+        if save_error:
+            messages.append(self.tr("Could not save settings: {}").format(save_error))
+        if not messages:
+            messages.append(self.tr("Settings applied and saved."))
+        self._message.setText("\n".join(messages))
+        self._form_host.setEnabled(True)
+        self._sync_manual_controls()
+        self._apply.setEnabled(True)

@@ -90,7 +90,7 @@ def app_stylesheet() -> str:
 
 
 
-from processing import STATUS_ALARM, STATUS_NO_REFERENCE, STATUS_NORMAL
+from processing import STATUS_ALARM, STATUS_NO_REFERENCE, STATUS_NORMAL, STATUS_UNCHECKED
 
 # Минимальная ширина панели камеры: три кнопки в ряд должны поместиться,
 # когда PREVIEW_WIDTH делится между камерами.
@@ -256,6 +256,7 @@ class MainWindow(QMainWindow):
         any_alarm = any(s == STATUS_ALARM for s in self._statuses)
         any_no_camera = any(s == NO_CAMERA for s in self._statuses)
         any_no_reference = any(s == STATUS_NO_REFERENCE for s in self._statuses)
+        any_unchecked = any(s == STATUS_UNCHECKED for s in self._statuses)
 
         if any_alarm:
             self._current_status = STATUS_ALARM
@@ -263,10 +264,12 @@ class MainWindow(QMainWindow):
             self._current_status = NO_CAMERA
         elif any_no_reference:
             self._current_status = STATUS_NO_REFERENCE
+        elif any_unchecked:
+            self._current_status = STATUS_UNCHECKED
         else:
             self._current_status = STATUS_NORMAL
 
-        gpio.set_ready(not any_no_camera and not any_no_reference)
+        gpio.set_ready(not (any_no_camera or any_no_reference or any_unchecked))
 
 
     def _on_gpio_action(self, method: str):
@@ -293,7 +296,8 @@ class MainWindow(QMainWindow):
         # config.CHANGE_RATIO_THRESHOLD при каждом кадре.
         config.CHANGE_RATIO_THRESHOLD = slider_value / 1000.0
         self._update_threshold_label(slider_value)
-        controller.reset_confirmation()
+        for panel in self._panels:
+            panel.reset_confirmation()
 
     def _set_status(self, status: str):
         texts = {

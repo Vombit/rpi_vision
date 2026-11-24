@@ -4,6 +4,46 @@
 <context>
     <name>CameraPanel</name>
     <message>
+        <source>Clipping: {:.1f}% (limit {:.1f}%)</source>
+        <translation>Новая засветка или потеря деталей в тени: {:.1f}% (предел {:.1f}%)</translation>
+    </message>
+    <message>
+        <source>Inspection zone left the frame</source>
+        <translation>Зона проверки вышла из кадра</translation>
+    </message>
+    <message>
+        <source>Part alignment failed</source>
+        <translation>Не удалось совместить деталь с эталоном</translation>
+    </message>
+    <message>
+        <source>Reset zone</source>
+        <translation>Сбросить зону</translation>
+    </message>
+    <message>
+        <source>Reference: setting...</source>
+        <translation>Запись эталона…</translation>
+    </message>
+    <message>
+        <source>Reference: capture failed</source>
+        <translation>Эталон: не удалось записать</translation>
+    </message>
+    <message>
+        <source>STATUS: FRAME NOT CHECKED</source>
+        <translation>КАДР НЕ ПРОВЕРЕН</translation>
+    </message>
+    <message>
+        <source>STATUS: CHECKING DEFECT</source>
+        <translation>ПРОВЕРКА ДЕФЕКТА…</translation>
+    </message>
+    <message>
+        <source>STATUS: DEFECT</source>
+        <translation>ДЕФЕКТ</translation>
+    </message>
+    <message>
+        <source>Trigger: FRAME NOT CHECKED</source>
+        <translation>Триггер: кадр не проверен</translation>
+    </message>
+    <message>
         <location filename="../camera_panel.py" line="61"/>
         <source>Camera:</source>
         <translation>Камера:</translation>
@@ -252,6 +292,109 @@ Check that v4l2-ctl is installed and the camera is free.</source>
     <message>
         <source>Reference: draw the area</source>
         <translation type="vanished">Эталон: выделите область</translation>
+    </message>
+</context>
+<context>
+    <name>OpenCVCameraSettingsDialog</name>
+    <message>
+        <source>Camera settings</source>
+        <translation>Настройки камеры</translation>
+    </message>
+    <message>
+        <source>Reading camera controls…</source>
+        <translation>Чтение параметров камеры…</translation>
+    </message>
+    <message>
+        <source>{} · Values use camera driver units.</source>
+        <translation>{} · Значения в единицах драйвера камеры.</translation>
+    </message>
+    <message>
+        <source>Controls are unavailable for this camera backend.</source>
+        <translation>Этот драйвер не предоставляет параметры камеры.</translation>
+    </message>
+    <message>
+        <source>Unknown</source>
+        <translation>Неизвестно</translation>
+    </message>
+    <message>
+        <source>Manual</source>
+        <translation>Ручной</translation>
+    </message>
+    <message>
+        <source>Automatic</source>
+        <translation>Автоматический</translation>
+    </message>
+    <message>
+        <source>Apply</source>
+        <translation>Применить</translation>
+    </message>
+    <message>
+        <source>Close</source>
+        <translation>Закрыть</translation>
+    </message>
+    <message>
+        <source>Auto exposure</source>
+        <translation>Автоэкспозиция</translation>
+    </message>
+    <message>
+        <source>Autofocus</source>
+        <translation>Автофокус</translation>
+    </message>
+    <message>
+        <source>Auto white balance</source>
+        <translation>Автобаланс белого</translation>
+    </message>
+    <message>
+        <source>Exposure</source>
+        <translation>Выдержка</translation>
+    </message>
+    <message>
+        <source>Gain</source>
+        <translation>Усиление</translation>
+    </message>
+    <message>
+        <source>Focus</source>
+        <translation>Фокус</translation>
+    </message>
+    <message>
+        <source>White balance</source>
+        <translation>Баланс белого</translation>
+    </message>
+    <message>
+        <source>Brightness</source>
+        <translation>Яркость</translation>
+    </message>
+    <message>
+        <source>Contrast</source>
+        <translation>Контраст</translation>
+    </message>
+    <message>
+        <source>Saturation</source>
+        <translation>Насыщенность</translation>
+    </message>
+    <message>
+        <source>Sharpness</source>
+        <translation>Резкость</translation>
+    </message>
+    <message>
+        <source>Applying camera controls…</source>
+        <translation>Применение параметров камеры…</translation>
+    </message>
+    <message>
+        <source>Driver rejected or changed: {}</source>
+        <translation>Драйвер отклонил или изменил значения: {}</translation>
+    </message>
+    <message>
+        <source>Driver accepted without readback: {}</source>
+        <translation>Драйвер принял значения без подтверждения чтением: {}</translation>
+    </message>
+    <message>
+        <source>Could not save settings: {}</source>
+        <translation>Не удалось сохранить настройки: {}</translation>
+    </message>
+    <message>
+        <source>Settings applied and saved.</source>
+        <translation>Настройки применены и сохранены.</translation>
     </message>
 </context>
 </TS>

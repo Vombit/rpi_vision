@@ -104,10 +104,9 @@ V4L2_SETTINGS_FILE = "camera_settings.json"
 # не навязываем (CAP_PROP_FPS не трогаем) — только дросселируем
 # выдачу кадров: если камера медленнее, идём с её скоростью.
 CAPTURE_MAX_FPS = 60
-# Порядок перебора VideoCapture-бэкендов на Windows (headless-пакета достаточно,
-# здесь важен именно флаг, а не замена на opencv-python).
-# OPENCV_BACKENDS_PREFER = ("DSHOW", "MSMF")
-OPENCV_BACKENDS_PREFER = ("V4L2")
+# None выбирает порядок для ОС: V4L2 на Linux, DSHOW / MSMF на Windows.
+# Для конкретной установки можно задать свой кортеж имён.
+OPENCV_BACKENDS_PREFER = None
 
 # Предпросмотр в GUI. PREVIEW_WIDTH — суммарная ширина всех полей превью:
 # при CAMERA_COUNT = 2 делится пополам (но не ниже 380 px на панель, иначе
@@ -130,14 +129,23 @@ DEFAULT_ROI = None
 
 # Сравнение
 PIXEL_THRESHOLD = 25          # изменение яркости пикселя ниже — шум
-MIN_AREA = 50                 # мин. площадь области (пикселей рабочего кадра)
+MIN_AREA = 50                 # мин. площадь для полного кадра, пропорционально меньше в выбранной зоне
 CHANGE_RATIO_THRESHOLD = 0.01  # мин. доля изменившихся пикселей
 CONFIRMATION_FRAMES = 2       # сколько подряд "изменено" = подтверждённое событие
+
+# Совмещение по полному кадру, единицы — рабочие пиксели IMAGE_WIDTH × IMAGE_HEIGHT.
+REGISTRATION_MAX_SHIFT = 24
+REGISTRATION_PATCH_SIZE = 19
+REGISTRATION_GRID_STEP = 20
+REGISTRATION_MIN_SCORE = 0.74
+REGISTRATION_PEAK_MARGIN = 0.06
+REGISTRATION_MIN_COVERAGE = 0.72
+REGISTRATION_MAX_NEW_CLIPPING = 0.20
+REGISTRATION_MAX_FULL_FRAME_CLIPPING = 0.05
 
 # Предобработка
 USE_GRAYSCALE = True          # переключаемо (ТЗ 5.2)
 BLUR_KERNEL = 3               # Gaussian Blur, нечётное; 1 = выкл
-BRIGHTNESS_TOLERANCE = 15     # компенсировать сдвиг средней яркости в этих пределах
 
 # Отладка (ТЗ 17)
 DEBUG = False

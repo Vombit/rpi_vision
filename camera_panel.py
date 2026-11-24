@@ -1,5 +1,8 @@
+import sys
+import time
+
 import cv2
-from PySide6.QtCore import QMetaObject, QThread, Qt, Signal, Slot
+from PySide6.QtCore import QThread, Qt, Signal, Slot
 from PySide6.QtGui import QImage, QPixmap
 from PySide6.QtWidgets import (
     QComboBox,
@@ -12,11 +15,16 @@ from PySide6.QtWidgets import (
 )
 
 import config
+import registration
 import v4l2
-from camera_settings import CameraSettingsDialog
+from camera_settings import CameraSettingsDialog, OpenCVCameraSettingsDialog
 from capture import CaptureThread
 from controller import Controller
-from processing import STATUS_ALARM, STATUS_NO_REFERENCE, STATUS_NORMAL, Processor
+from preprocessing import roi_bounds
+from processing import (
+    STATUS_ALARM, STATUS_NO_REFERENCE, STATUS_NORMAL, STATUS_UNCHECKED,
+    FrameResult, Processor,
+)
 from video_view import VideoView
 
 NO_CAMERA = "NO_CAMERA"
@@ -28,21 +36,30 @@ class CameraPanel(QWidget):
     """
 
     status_changed = Signal(int, str)
+    configuration_changed = Signal(int, object, object)
+    reference_requested = Signal(float)
+    detection_requested = Signal(float, int)
+    confirmation_reset = Signal()
 
     def __init__(self, slot_index: int, preview_size, cameras, parent=None):
         super().__init__(parent)
         self.slot_index = slot_index
         self.roi = getattr(config, "DEFAULT_ROI", None)
+        self._display_roi = None
+        self._generation = 0
         self._status = NO_CAMERA
         self._capture_thread = None
         self.preview_width, self.preview_height = preview_size
 
-        self.controller = Controller(get_roi=lambda: self.roi)
-        self._processor = Processor(self.controller)
+        self._processor = Processor(Controller())
         self._process_thread = QThread(self)
         self._processor.moveToThread(self._process_thread)
         self._processor.result_ready.connect(self._on_result)
         self._processor.detection_done.connect(self._on_detection_done)
+        self.configuration_changed.connect(self._processor.configure)
+        self.reference_requested.connect(self._processor.on_set_reference)
+        self.detection_requested.connect(self._processor.on_detect)
+        self.confirmation_reset.connect(self._processor.reset_confirmation)
         self._process_thread.start()
 
         column = QVBoxLayout(self)
@@ -131,8 +148,8 @@ class CameraPanel(QWidget):
 
     def _on_camera_selected(self):
         self.stop_capture()
-        self.controller.clear_reference()
         self.roi = getattr(config, "DEFAULT_ROI", None)
+        self._display_roi = None
         self.reference_label.setText(self.tr("Reference: NOT SET"))
         self.trigger_label.setText(self.tr("Trigger: -"))
         self._set_status(NO_CAMERA)
@@ -145,39 +162,52 @@ class CameraPanel(QWidget):
         index = self.camera_combo.currentData()
         if index is None:
             return
-        device = v4l2.device_for_index(index)
-        if not v4l2.available():
+        if sys.platform.startswith("linux") and v4l2.available():
+            device = v4l2.device_for_index(index)
+            dialog = CameraSettingsDialog(index, device, v4l2.controls_for_index(index), self)
+        elif self._capture_thread and self._capture_thread.isRunning():
+            dialog = OpenCVCameraSettingsDialog(self._capture_thread, self)
+        else:
             QMessageBox.information(
                 self, self.tr("Camera settings"),
-                self.tr("v4l2-ctl is not available.\nInstall it with: sudo apt install v4l-utils"))
+                self.tr("Camera not available"))
             return
-        dialog = CameraSettingsDialog(index, device, v4l2.controls_for_index(index), self)
-        dialog.exec()
+        dialog.applying.connect(self._on_camera_settings_changed)
+        try:
+            dialog.exec()
+        finally:
+            dialog.deleteLater()
+
+    @Slot()
+    def _on_camera_settings_changed(self):
+        self._change_roi(self.roi)
 
     def start_capture(self, camera_index):
         if camera_index is None:
             self._on_camera_error()
             return
         self.stop_capture()
-        self._capture_thread = CaptureThread(
-            camera_index,
-            preview_size=(self.preview_width, self.preview_height),
-            roi_getter=lambda: self.roi,
-        )
-        self._capture_thread.camera_error.connect(self._on_camera_error)
-        self._capture_thread.frame_captured.connect(self._processor.on_frame)
+        self._capture_thread = CaptureThread(camera_index)
+        self._capture_thread.camera_error.connect(self._on_capture_error)
+        self._capture_thread.frame_captured.connect(self._processor.on_frame_available)
         self._capture_thread.finished.connect(self._capture_thread.deleteLater)
+        self._configure_processor(self._capture_thread)
         self._capture_thread.start()
+
+    def _configure_processor(self, source):
+        self._generation += 1
+        self.configuration_changed.emit(self._generation, source, self.roi)
 
     def stop_capture(self):
         thread, self._capture_thread = self._capture_thread, None
         if thread is not None:
+            self._configure_processor(None)
             try:
-                thread.camera_error.disconnect(self._on_camera_error)
+                thread.camera_error.disconnect(self._on_capture_error)
             except Exception:
                 pass
             try:
-                thread.frame_captured.disconnect(self._processor.on_frame)
+                thread.frame_captured.disconnect(self._processor.on_frame_available)
             except Exception:
                 pass
             thread.stop()
@@ -190,30 +220,32 @@ class CameraPanel(QWidget):
 
     @Slot(float, float, float, float)
     def _on_roi_selected(self, x0: float, y0: float, x1: float, y1: float):
-        # Запоминаем новую рамку. Старый эталон сбрасывается, так как изменилась зона.
-        self.roi = (x0, y0, x1, y1)
-        self.controller.clear_reference()
-        self.reference_label.setText(self.tr("Reference: NOT SET"))
-        self.change_label.setText(self.tr("Change: -"))
-        self._set_status(STATUS_NO_REFERENCE)
+        left, top, right, bottom = self._display_roi or (0.0, 0.0, 1.0, 1.0)
+        width, height = right - left, bottom - top
+        self._change_roi((left + x0 * width, top + y0 * height,
+                          left + x1 * width, top + y1 * height))
 
-    @Slot()
-    def _on_set_reference(self):
-        # Берем текущую рамку (или весь кадр, если рамки нет) и сразу ставим эталон.
-        self.reference_label.setText(self.tr("Reference: setting..."))
-        self._request_reference()
-
-    @Slot()
-    def _on_reset_roi(self):
-        # Сбрасываем рамку на весь кадр
-        self.roi = getattr(config, "DEFAULT_ROI", None)
-        self.controller.clear_reference()
-        self.controller.reset_confirmation()
+    def _change_roi(self, roi):
+        self.roi = roi
+        self._configure_processor(self._capture_thread)
         self.reference_label.setText(self.tr("Reference: NOT SET"))
         self.change_label.setText(self.tr("Change: -"))
         self.last_check_label.setText(self.tr("Last check: -"))
         self.trigger_label.setText(self.tr("Trigger: -"))
         self._set_status(STATUS_NO_REFERENCE)
+
+    @Slot()
+    def _on_set_reference(self):
+        started = time.perf_counter()
+        self._configure_processor(self._capture_thread)
+        self._set_status(STATUS_NO_REFERENCE)
+        self.reference_label.setText(self.tr("Reference: setting..."))
+        self.trigger_label.setText(self.tr("Trigger: -"))
+        self.reference_requested.emit(started)
+
+    @Slot()
+    def _on_reset_roi(self):
+        self._change_roi(getattr(config, "DEFAULT_ROI", None))
 
     @Slot()
     def reset_roi(self):
@@ -225,23 +257,27 @@ class CameraPanel(QWidget):
 
     @Slot()
     def request_detect(self):
-        QMetaObject.invokeMethod(self._processor, "on_detect",
-                                 Qt.ConnectionType.QueuedConnection)
+        self.detection_requested.emit(time.perf_counter(), self._generation)
 
-    def _request_reference(self):
-        QMetaObject.invokeMethod(self._processor, "on_set_reference",
-                                 Qt.ConnectionType.QueuedConnection)
+    @Slot(int, str)
+    def _on_detection_done(self, generation, status):
+        if generation != self._generation:
+            return
+        texts = {
+            STATUS_ALARM: (self.tr("Trigger: CHANGED"), "#e33"),
+            STATUS_NORMAL: (self.tr("Trigger: NO CHANGE"), "#3c3"),
+            STATUS_UNCHECKED: (self.tr("Trigger: FRAME NOT CHECKED"), "#ca3"),
+        }
+        text, color = texts[status]
+        self.trigger_label.setText(text)
+        self.trigger_label.setStyleSheet(
+            f"font-family: monospace; font-size: 14px; color: {color}; background: transparent;")
 
-    def _on_detection_done(self, changed: bool, change_ratio: float,
-                           elapsed_ms: float, boxes: list):
-        if changed:
-            self.trigger_label.setText(self.tr("Trigger: CHANGED"))
-            self.trigger_label.setStyleSheet(
-                "font-family: monospace; font-size: 14px; color: #e33; font-weight: bold; background: transparent;")
-        else:
-            self.trigger_label.setText(self.tr("Trigger: NO CHANGE"))
-            self.trigger_label.setStyleSheet(
-                "font-family: monospace; font-size: 14px; color: #3c3; background: transparent;")
+    @Slot(object)
+    def _on_capture_error(self, source):
+        if source is self._capture_thread:
+            self._configure_processor(None)
+            self._on_camera_error()
 
     def _on_camera_error(self):
         self.video.setPixmap(QPixmap())
@@ -255,52 +291,73 @@ class CameraPanel(QWidget):
         self.set_reference_button.setEnabled(False)
         self.reset_roi_button.setEnabled(False)
 
-    def _on_result(self, frame, status: str, elapsed_ms: float, has_reference: bool,
-                   change_ratio: float, boxes: list):
-        self._set_status(status)
-
-        try:
-            if frame is None or getattr(frame, "size", 0) == 0:
-                return
-            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            if boxes:
-                color = (255, 51, 51) if status == STATUS_ALARM else (51, 204, 51)
-                sx = rgb.shape[1] / config.IMAGE_WIDTH
-                sy = rgb.shape[0] / config.IMAGE_HEIGHT
-                for x, y, w, h, _area in boxes:
-                    cv2.rectangle(
-                        rgb,
-                        (int(x * sx), int(y * sy)),
-                        (int((x + w) * sx), int((y + h) * sy)),
-                        color,
-                        2,
-                    )
-            image = QImage(rgb.data, rgb.shape[1], rgb.shape[0], rgb.strides[0],
-                           QImage.Format.Format_RGB888)
-            self.video.setPixmap(QPixmap.fromImage(image.copy()))
-        except Exception:
+    @Slot(object)
+    def _on_result(self, result: FrameResult):
+        if result.generation != self._generation:
             return
+        self._set_status(result.status, defect_pending=result.defect_pending)
 
-        self.reference_label.setText(
-            self.tr("Reference: OK") if has_reference else self.tr("Reference: NOT SET")
-        )
-        if has_reference:
+        frame = result.frame
+        height, width = frame.shape[:2]
+        left, top, right, bottom = roi_bounds(frame.shape, result.roi)
+        self._display_roi = (left / width, top / height, right / width, bottom / height)
+        preview = cv2.resize(frame[top:bottom, left:right], (self.preview_width, self.preview_height),
+                             interpolation=cv2.INTER_AREA)
+        rgb = cv2.cvtColor(preview, cv2.COLOR_GRAY2RGB if preview.ndim == 2 else cv2.COLOR_BGR2RGB)
+        color = (255, 51, 51) if result.status == STATUS_ALARM else (255, 204, 51)
+        sx, sy = self.preview_width / (right - left), self.preview_height / (bottom - top)
+        for x, y, w, h, _area in result.boxes:
+            x0 = round((x * width / config.IMAGE_WIDTH - left) * sx)
+            y0 = round((y * height / config.IMAGE_HEIGHT - top) * sy)
+            x1 = round(((x + w) * width / config.IMAGE_WIDTH - left) * sx)
+            y1 = round(((y + h) * height / config.IMAGE_HEIGHT - top) * sy)
+            cv2.rectangle(rgb, (x0, y0), (x1, y1), color, 2)
+        image = QImage(rgb.data, self.preview_width, self.preview_height, rgb.strides[0],
+                       QImage.Format.Format_RGB888)
+        self.video.setPixmap(QPixmap.fromImage(image.copy()))
+
+        if result.has_reference:
+            self.reference_label.setText(self.tr("Reference: OK"))
+        elif result.reference_pending:
+            self.reference_label.setText(self.tr("Reference: setting..."))
+        elif result.status == STATUS_UNCHECKED:
+            self.reference_label.setText(self.tr("Reference: capture failed"))
+        else:
+            self.reference_label.setText(self.tr("Reference: NOT SET"))
+        if result.has_reference and (result.status != STATUS_UNCHECKED or result.boxes):
             self.change_label.setText(
-                self.tr("Change: {} %").format(round(change_ratio * 100, 2)))
+                self.tr("Change: {} %").format(round(result.change_ratio * 100, 2)))
+        elif result.unchecked_reason == registration.ISSUE_CLIPPING and result.clipping is not None:
+            clipped, limit = result.clipping
+            self.change_label.setText(self.tr("Clipping: {:.1f}% (limit {:.1f}%)").format(
+                clipped * 100, limit * 100))
+        elif result.unchecked_reason == registration.ISSUE_OUT_OF_FRAME:
+            self.change_label.setText(self.tr("Inspection zone left the frame"))
+        elif result.unchecked_reason == registration.ISSUE_ALIGNMENT:
+            self.change_label.setText(self.tr("Part alignment failed"))
+        else:
+            self.change_label.setText(self.tr("Change: -"))
+
+        if result.has_reference:
             self.last_check_label.setText(
-                self.tr("Last check: {} ms").format(round(elapsed_ms, 1)))
+                self.tr("Last check: {} ms").format(round(result.elapsed_ms, 1)))
+        else:
+            self.last_check_label.setText(self.tr("Last check: -"))
         
         self.set_reference_button.setEnabled(True)
         self.reset_roi_button.setEnabled(True)
 
-    def _set_status(self, status: str):
+    def _set_status(self, status: str, *, defect_pending=False):
         texts = {
             STATUS_NORMAL: (self.tr("STATUS: NORMAL"), "#3c3"),
-            STATUS_ALARM: (self.tr("STATUS: ALARM"), "#e33"),
+            STATUS_ALARM: (self.tr("STATUS: DEFECT"), "#e33"),
+            STATUS_UNCHECKED: (self.tr("STATUS: FRAME NOT CHECKED"), "#ca3"),
             STATUS_NO_REFERENCE: (self.tr("STATUS: NO REFERENCE"), "#aa3"),
             NO_CAMERA: (self.tr("STATUS: NO CAMERA"), "#e33"),
         }
         text, color = texts[status]
+        if defect_pending:
+            text = self.tr("STATUS: CHECKING DEFECT")
         self.status_label.setText(text)
         self.status_label.setStyleSheet(
             f"font-family: monospace; font-size: 14px; font-weight: bold; color: {color}; background: transparent;"
@@ -314,4 +371,4 @@ class CameraPanel(QWidget):
         return self._status
 
     def reset_confirmation(self):
-        self.controller.reset_confirmation()
+        self.confirmation_reset.emit()
