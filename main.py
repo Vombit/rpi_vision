@@ -92,9 +92,8 @@ def app_stylesheet() -> str:
 
 from processing import STATUS_ALARM, STATUS_NO_REFERENCE, STATUS_NORMAL, STATUS_UNCHECKED
 
-# Минимальная ширина панели камеры: три кнопки в ряд должны поместиться,
-# когда PREVIEW_WIDTH делится между камерами.
-MIN_PANEL_WIDTH = 380
+# Предпочтительная начальная ширина панели с учётом кнопок.
+PREFERRED_PANEL_WIDTH = 380
 
 
 class MainWindow(QMainWindow):
@@ -104,21 +103,23 @@ class MainWindow(QMainWindow):
         self._camera_count = max(1, int(getattr(config, "CAMERA_COUNT", 1)))
         
         # Считаем размер панели
-        self._panel_width = max(config.PREVIEW_WIDTH // self._camera_count, MIN_PANEL_WIDTH)
-        self.setMinimumSize(self._panel_width * self._camera_count + 300,
-                            config.PREVIEW_HEIGHT + 200)
+        preview_width = max(1, config.PREVIEW_WIDTH // self._camera_count)
+        screen_size = self.screen().availableGeometry().size()
+        self.resize(
+            min(max(preview_width, PREFERRED_PANEL_WIDTH) * self._camera_count + 300,
+                screen_size.width()),
+            min(config.PREVIEW_HEIGHT + 200, screen_size.height()),
+        )
 
         central = QWidget()
         self.setCentralWidget(central)
         layout = QVBoxLayout(central)
-        layout.setAlignment(Qt.AlignmentFlag.AlignTop)
         layout.setContentsMargins(20, 20, 20, 20)
         layout.setSpacing(20)
 
         cameras = camera_module.list_cameras()
 
         cameras_row = QHBoxLayout()
-        cameras_row.setAlignment(Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignLeft)
         cameras_row.setSpacing(20)
 
         self._panels = []
@@ -126,10 +127,10 @@ class MainWindow(QMainWindow):
         
         # 1. Добавляем сами панели камер
         for slot in range(self._camera_count):
-            panel = CameraPanel(slot, (self._panel_width, config.PREVIEW_HEIGHT), cameras)
+            panel = CameraPanel(slot, (preview_width, config.PREVIEW_HEIGHT), cameras)
             panel.status_changed.connect(self._on_panel_status)
             self._panels.append(panel)
-            cameras_row.addWidget(panel)
+            cameras_row.addWidget(panel, stretch=1)
             
         # 2. Добавляем кнопку Refresh прямо СЮДА ЖЕ, прижимая её к верху
         self.refresh_button = QPushButton(self.tr("Refresh"))
@@ -137,13 +138,10 @@ class MainWindow(QMainWindow):
         # AlignTop гарантирует, что она встанет на одну линию с ComboBox и Settings
         cameras_row.addWidget(self.refresh_button, alignment=Qt.AlignmentFlag.AlignTop)
 
-        # 3. Пружина, которая отодвигает слайдер к правому краю
-        cameras_row.addStretch(1)
-        
-        # 4. Панель со слайдером (кнопки + и -)
+        # Панель со слайдером (кнопки + и -)
         cameras_row.addLayout(self._build_threshold_panel()) 
         
-        layout.addLayout(cameras_row)
+        layout.addLayout(cameras_row, stretch=1)
 
         # --- ИНИЦИАЛИЗАЦИЯ GPIO ---
         self._current_status = NO_CAMERA
@@ -211,7 +209,7 @@ class MainWindow(QMainWindow):
         self.threshold_slider.setTickInterval(20)
         self.threshold_slider.setSingleStep(1)
         self.threshold_slider.setPageStep(10)
-        self.threshold_slider.setMinimumHeight(380)
+        self.threshold_slider.setMaximumHeight(config.PREVIEW_HEIGHT)
         self.threshold_slider.valueChanged.connect(self._on_threshold_changed)
         self._update_threshold_label(initial)
 

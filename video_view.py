@@ -14,9 +14,7 @@ class VideoView(QLabel):
     pixmap/текст через setPixmap/setText — это продолжает работать,
     мы только дорисовываем рамку выделения поверх картинки.
 
-    Размер виджета = PREVIEW_WIDTH x PREVIEW_HEIGHT, поэтому координаты
-    виджета совпадают с координатами превью. Сигнал отдаёт нормализованные
-    доли кадра — ROI переживает смену разрешения/камеры.
+    Сигнал отдаёт нормализованные доли отображаемого кадра.
     """
 
     # x0, y0, x1, y1 в долях кадра (0..1)
@@ -33,6 +31,13 @@ class VideoView(QLabel):
         self._anchor = None
         self._rubber = None
         self.update()
+
+    def _image_rect(self):
+        pixmap = self.pixmap()
+        if pixmap.isNull():
+            return QRect()
+        return self.style().itemPixmapRect(
+            self.contentsRect(), int(self.alignment()), pixmap)
 
     def paintEvent(self, event):
         super().paintEvent(event)
@@ -51,7 +56,10 @@ class VideoView(QLabel):
         if not self.selection_enabled or event.button() != Qt.MouseButton.LeftButton:
             super().mousePressEvent(event)
             return
-        self._anchor = event.position().toPoint()
+        point = event.position().toPoint()
+        if not self._image_rect().contains(point):
+            return
+        self._anchor = point
         self._rubber = QRect(self._anchor, self._anchor)
         self.update()
 
@@ -59,7 +67,8 @@ class VideoView(QLabel):
         if self._anchor is None:
             super().mouseMoveEvent(event)
             return
-        self._rubber = QRect(self._anchor, event.position().toPoint()).normalized()
+        self._rubber = QRect(self._anchor, event.position().toPoint()).normalized().intersected(
+            self._image_rect())
         self.update()
 
     def mouseReleaseEvent(self, event):
@@ -70,13 +79,12 @@ class VideoView(QLabel):
         self._anchor = None
         self._rubber = None
         self.update()
-        # Мышку можно увести за край виджета (Qt держит захват до отпускания) —
-        # обрезаем по границам превью, иначе ROI уедет за 1.0.
-        rect = rect.intersected(self.rect())
+        image_rect = self._image_rect()
+        rect = rect.intersected(image_rect)
         if rect.width() < MIN_ROI_PX or rect.height() < MIN_ROI_PX:
             return
-        width = max(self.width(), 1)
-        height = max(self.height(), 1)
+        rect.translate(-image_rect.x(), -image_rect.y())
+        width, height = image_rect.width(), image_rect.height()
         self.roi_selected.emit(
             rect.left() / width,
             rect.top() / height,

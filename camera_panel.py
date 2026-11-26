@@ -2,7 +2,7 @@ import sys
 import time
 
 import cv2
-from PySide6.QtCore import QThread, Qt, Signal, Slot
+from PySide6.QtCore import QSize, QThread, Qt, Signal, Slot
 from PySide6.QtGui import QImage, QPixmap
 from PySide6.QtWidgets import (
     QComboBox,
@@ -10,6 +10,7 @@ from PySide6.QtWidgets import (
     QLabel,
     QMessageBox,
     QPushButton,
+    QSizePolicy,
     QVBoxLayout,
     QWidget,
 )
@@ -49,8 +50,6 @@ class CameraPanel(QWidget):
         self._generation = 0
         self._status = NO_CAMERA
         self._capture_thread = None
-        self.preview_width, self.preview_height = preview_size
-
         self._processor = Processor(Controller())
         self._process_thread = QThread(self)
         self._processor.moveToThread(self._process_thread)
@@ -78,7 +77,8 @@ class CameraPanel(QWidget):
         column.addLayout(camera_row)
 
         self.video = VideoView()
-        self.video.setFixedSize(self.preview_width, self.preview_height)
+        self.video.setMaximumSize(*preview_size)
+        self.video.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Ignored)
         self.video.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.video.setStyleSheet(
             "background-color: #202020; color: #aaaaaa; border: 1px solid #444;")
@@ -86,7 +86,7 @@ class CameraPanel(QWidget):
         self.video.roi_selected.connect(self._on_roi_selected)
         # РАЗРЕШАЕМ РИСОВАТЬ РАМКУ ВСЕГДА
         self.video.set_selection_enabled(True)
-        column.addWidget(self.video, alignment=Qt.AlignmentFlag.AlignHCenter)
+        column.addWidget(self.video, stretch=1)
 
         transparent_bg = "background: transparent;"
         mono = "font-family: monospace; font-size: 14px; " + transparent_bg
@@ -301,18 +301,22 @@ class CameraPanel(QWidget):
         height, width = frame.shape[:2]
         left, top, right, bottom = roi_bounds(frame.shape, result.roi)
         self._display_roi = (left / width, top / height, right / width, bottom / height)
-        preview = cv2.resize(frame[top:bottom, left:right], (self.preview_width, self.preview_height),
+        available = self.video.contentsRect().size().expandedTo(QSize(1, 1))
+        size = QSize(right - left, bottom - top).scaled(
+            available, Qt.AspectRatioMode.KeepAspectRatio)
+        preview_width, preview_height = max(1, size.width()), max(1, size.height())
+        preview = cv2.resize(frame[top:bottom, left:right], (preview_width, preview_height),
                              interpolation=cv2.INTER_AREA)
         rgb = cv2.cvtColor(preview, cv2.COLOR_GRAY2RGB if preview.ndim == 2 else cv2.COLOR_BGR2RGB)
         color = (255, 51, 51) if result.status == STATUS_ALARM else (255, 204, 51)
-        sx, sy = self.preview_width / (right - left), self.preview_height / (bottom - top)
+        sx, sy = preview_width / (right - left), preview_height / (bottom - top)
         for x, y, w, h, _area in result.boxes:
             x0 = round((x * width / config.IMAGE_WIDTH - left) * sx)
             y0 = round((y * height / config.IMAGE_HEIGHT - top) * sy)
             x1 = round(((x + w) * width / config.IMAGE_WIDTH - left) * sx)
             y1 = round(((y + h) * height / config.IMAGE_HEIGHT - top) * sy)
             cv2.rectangle(rgb, (x0, y0), (x1, y1), color, 2)
-        image = QImage(rgb.data, self.preview_width, self.preview_height, rgb.strides[0],
+        image = QImage(rgb.data, preview_width, preview_height, rgb.strides[0],
                        QImage.Format.Format_RGB888)
         self.video.setPixmap(QPixmap.fromImage(image.copy()))
 
