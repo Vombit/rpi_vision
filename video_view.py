@@ -1,6 +1,6 @@
-from PySide6.QtCore import QRect, Qt, Signal
-from PySide6.QtGui import QColor, QPainter, QPen
-from PySide6.QtWidgets import QLabel
+from PySide6.QtCore import QRect, QRectF, Qt, Signal
+from PySide6.QtGui import QColor, QPainter, QPainterPath, QPen
+from PySide6.QtWidgets import QFrame, QLabel
 
 # Минимальный размер выделяемой области, px превью. Короче — считаем промахом
 # (случайный клик мышью) и молча игнорируем.
@@ -40,6 +40,21 @@ class VideoView(QLabel):
             self.contentsRect(), int(self.alignment()), pixmap)
 
     def paintEvent(self, event):
+        if self.pixmap().isNull() and self.text():
+            QFrame.paintEvent(self, event)
+            painter = QPainter(self)
+            painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+            text_path = QPainterPath()
+            text_path.addText(0, 0, self.font(), self.text())
+            offset = QRectF(self.contentsRect()).center() - text_path.boundingRect().center()
+            text_path.translate(offset)
+            outline = QPen(Qt.GlobalColor.white)
+            outline.setWidth(3)
+            outline.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
+            painter.strokePath(text_path, outline)
+            painter.fillPath(text_path, Qt.GlobalColor.black)
+            return
+
         super().paintEvent(event)
         if self._rubber is None:
             return
